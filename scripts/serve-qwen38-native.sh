@@ -5,7 +5,8 @@
 #
 #   bash scripts/serve-qwen38-native.sh <checkpoint-dir>
 #
-# Overridable: ENV_PREFIX K GMU MML MNS MBT PORT DECODE_PARTITION THINKING
+# Overridable: ENV_PREFIX K GMU MML MNS MBT PORT DECODE_PARTITION THINKING SERVED_MODEL_NAME
+#             TP DTYPE MM_LIMIT TOOL_CALL_PARSER
 #
 # The boot is GATED on OBSERVED EXECUTION, not on configuration strings: the
 # script refuses to report success unless the server
@@ -15,12 +16,16 @@
 #   1. GPUs must be free first. Booting over an occupied GPU yields a server
 #      that runs at a fraction of its speed instead of failing.
 #   2. served speculative depth == requested k.
-#   3. lm_head is served by the skinny kernel from the checkpoint's OWN
-#      NVFP4 codes -- witnessed by a vocab-shaped GEMM routing to qpn.
-#      (VLLM_SKINNY_LMHEAD_NATIVE is inert for ModelOpt checkpoints whose
-#      lm_head is already quantized in-checkpoint: that flag pulls native
-#      codes from a source shard for checkpoints whose head is UNquantized.
-#      Gating on its log line would fail every correct boot here.)
+#   3. lm_head is served as the checkpoint stores it. The mode is detected
+#      from the checkpoint's quantization_config: NVFP4 checkpoints (lm_head
+#      in quantized_layers) serve the head from their own 4-bit codes,
+#      witnessed by a vocab-shaped GEMM routing to qpn; BF16-LMHead
+#      checkpoints serve the dense head, witnessed by the "native BF16 head
+#      served dense" line. (VLLM_SKINNY_LMHEAD_NATIVE is inert for ModelOpt
+#      checkpoints whose lm_head is already quantized in-checkpoint: that
+#      flag pulls native codes from a source shard for checkpoints whose
+#      head is UNquantized. Gating on its log line would fail every correct
+#      boot here.)
 #   4. kv_cache_dtype == auto. A ModelOpt checkpoint may declare
 #      kv_cache_quant_algo=FP8, which describes how its WEIGHTS were made;
 #      honouring it below SM80 loses the tensor-core decode route and costs
@@ -38,6 +43,49 @@ CKPT="$(cd "$CKPT" && pwd)"
 ENV_PREFIX="${ENV_PREFIX:-$REPO_ROOT/.venv-sm70}"
 PY="$ENV_PREFIX/bin/python"
 [ -x "$PY" ] || { echo "ERROR: no environment at $ENV_PREFIX — run scripts/bootstrap-sm70.sh first" >&2; exit 2; }
+
+# ---- head mode: NVFP4 (lm_head quantized in-checkpoint) or BF16 (dense) ----
+# The checkpoint decides: the quantization block's quantized_layers mapping
+# "lm_head" to a quant algo means the head is stored as NVFP4 codes;
+# absent means the head is a dense BF16 tensor served as-is. ModelOpt writes
+# that block under "quantization" in hf_quant_config.json and under
+# "quantization_config" in config.json; accept either.
+HEAD_MODE=$("$PY" - "$CKPT" <<'EOF'
+import json, os, sys
+ckpt = sys.argv[1]
+ql = None
+for name in ("hf_quant_config.json", "config.json"):
+    p = os.path.join(ckpt, name)
+    if not os.path.exists(p):
+        continue
+    try:
+        cfg = json.load(open(p))
+    except Exception:
+        continue
+    for key in ("quantization", "quantization_config"):
+        qc = cfg.get(key)
+        if isinstance(qc, dict) and "quantized_layers" in qc:
+            ql = qc["quantized_layers"]
+            break
+    if ql is not None:
+        break
+def quantized(v):
+    # Entries are either an algo string ("NVFP4") or a per-layer dict
+    # ({"quant_algo": "NVFP4", "group_size": 16}).
+    if isinstance(v, str):
+        return bool(v)
+    if isinstance(v, dict):
+        return bool(v.get("quant_algo"))
+    return bool(v)
+if isinstance(ql, dict) and "lm_head" in ql and quantized(ql["lm_head"]):
+    print("nvfp4")
+elif isinstance(ql, list) and "lm_head" in ql:
+    print("nvfp4")
+else:
+    print("bf16")
+EOF
+)
+echo "==> lm_head mode: $HEAD_MODE"
 
 K="${K:-7}"; K1=$((K + 1)); K2=$((K1 * 2))
 # Bind to loopback by default. This server has NO authentication: anything that
@@ -75,6 +123,14 @@ MNS="${MNS:-1}"
 MBT="${MBT:-4096}"
 PORT="${PORT:-8000}"
 THINKING="${THINKING:-true}"
+# Served-model-name alias as seen by OpenAI clients. Upstream default (no
+# hyphen); deployments override it via their conf's SERVED_MODEL_NAME.
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.8-27b}"
+TP="${TP:-4}"
+DTYPE="${DTYPE:-float16}"
+# Multimodal limit per prompt (JSON). Overridable; 0/0 disables image/video.
+MM_LIMIT="${MM_LIMIT:-{\"image\":0,\"video\":0}}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
 # Pin the decode partition size. The default selector switches to 1024 at
 # max_model_len >= 32768, and the MTP verify path (which arrives as q>1) has
 # no active-partition skip, so a large MML taxes every round for capacity it
@@ -120,6 +176,15 @@ trap 'cleanup_on_fail' INT TERM
 rm -f "$LOG"
 echo "==> serving $CKPT  (k=$K, GMU=$GMU, MML=$MML, partition=$DECODE_PARTITION)"
 
+# lm_head flags per detected mode: NVFP4 checkpoints serve the head from
+# the checkpoint's own 4-bit codes; BF16-LMHead checkpoints serve the
+# dense head and must NOT set VLLM_SKINNY_LMHEAD_NATIVE.
+if [ "$HEAD_MODE" = nvfp4 ]; then
+  export VLLM_SKINNY_LMHEAD=1 VLLM_SKINNY_LMHEAD_NATIVE=1
+else
+  export VLLM_SKINNY_LMHEAD=1 VLLM_SKINNY_LMHEAD_BF16=1
+fi
+
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}" \
 TORCH_CUDA_ARCH_LIST=7.0 \
@@ -129,8 +194,6 @@ VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1 \
 VLLM_SKINNY_NVFP4=1 \
 VLLM_SKINNY_QPN=1 \
 VLLM_SKINNY_QPN2=1 \
-VLLM_SKINNY_LMHEAD=1 \
-VLLM_SKINNY_LMHEAD_NATIVE=1 \
 VLLM_SKINNY_DROP_CT=1 \
 VLLM_SKINNY_NVFP4_SRC="$REPO_ROOT/kernels/skinny_kernels.cu" \
 VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT=0 \
@@ -139,19 +202,19 @@ VLLM_SM70_QPN8_MT2=1 \
 VLLM_FLASH_V100_DECODE_PARTITION_SIZE="$DECODE_PARTITION" \
 setsid $NUMA_PREFIX "$PY" -m vllm.entrypoints.openai.api_server \
   --model "$CKPT" \
-  --served-model-name qwen3.8-27b \
+  --served-model-name "$SERVED_MODEL_NAME" \
   --trust-remote-code \
-  --dtype float16 \
+  --dtype "$DTYPE" \
   --attention-backend FLASH_ATTN_V100 \
-  --tensor-parallel-size 4 \
+  --tensor-parallel-size "$TP" \
   --gpu-memory-utilization "$GMU" \
   --max-model-len "$MML" \
   --max-num-seqs "$MNS" \
   --max-num-batched-tokens "$MBT" \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --limit-mm-per-prompt "$MM_LIMIT" \
   --default-chat-template-kwargs "{\"enable_thinking\":$THINKING}" \
   --reasoning-parser qwen3 \
-  --enable-auto-tool-choice --tool-call-parser hermes \
+  --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
   --compilation-config "{\"cudagraph_capture_sizes\":[$K1,$K2]}" \
   --speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$K,\"draft_sample_method\":\"greedy\",\"use_local_argmax_reduction\":true}" \
   --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null &
@@ -172,7 +235,7 @@ done
 # logits call, so gate 3 is not decidable until something has been served.
 WARM=$(curl -sf --max-time 300 "http://$PROBE:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Say ready."}],"temperature":0,"max_completion_tokens":8,"chat_template_kwargs":{"enable_thinking":false}}' 2>/dev/null) || WARM=""
+  -d "{\"model\":\"$SERVED_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Say ready.\"}],\"temperature\":0,\"max_completion_tokens\":8,\"chat_template_kwargs\":{\"enable_thinking\":false}}" 2>/dev/null) || WARM=""
 
 
 # ---- boot gate -----------------------------------------------------------
@@ -197,16 +260,31 @@ SERVED_K=$(grep -o "num_speculative_tokens[^,}]*" "$LOG" | head -1 | grep -o "[0
   || gate "served depth == $K" fail "log says '${SERVED_K:-<none>}'"
 
 # lm_head is [vocab, hidden]; at TP4 each rank owns vocab/4 rows. Any GEMM
-# whose N is far larger than a trunk projection is the vocab shard, and it
-# must route to a qpn kernel -- that is lm_head being served from the
-# checkpoint's own 4-bit codes rather than repacked.
-LMHEAD_ROUTE=$(grep -ohE "route map: M=[0-9]+ N=[0-9]{5,} K=[0-9]+ -> [a-z0-9]+" "$LOG" \
-               | grep -oE "\-> [a-z0-9]+$" | sed 's/-> //' | sort -u | tr '\n' ' ')
-case "$LMHEAD_ROUTE" in
-  *qpn*) gate "lm_head served from checkpoint codes (qpn)" ok ;;
-  "")    gate "lm_head served from checkpoint codes (qpn)" fail "no vocab-shaped GEMM observed" ;;
-  *)     gate "lm_head served from checkpoint codes (qpn)" fail "routed to: $LMHEAD_ROUTE" ;;
-esac
+# whose N is far larger than a trunk projection is the vocab shard.
+if [ "$HEAD_MODE" = nvfp4 ]; then
+  # NVFP4 mode: the vocab shard must route to a qpn kernel -- that is
+  # lm_head being served from the checkpoint's own 4-bit codes rather
+  # than repacked.
+  LMHEAD_ROUTE=$(grep -ohE "route map: M=[0-9]+ N=[0-9]{5,} K=[0-9]+ -> [a-z0-9]+" "$LOG" \
+                 | grep -oE "\-> [a-z0-9]+$" | sed 's/-> //' | sort -u | tr '\n' ' ')
+  case "$LMHEAD_ROUTE" in
+    *qpn*) gate "lm_head served from checkpoint codes (qpn, NVFP4 mode)" ok ;;
+    "")    gate "lm_head served from checkpoint codes (qpn, NVFP4 mode)" fail "no vocab-shaped GEMM observed" ;;
+    *)     gate "lm_head served from checkpoint codes (qpn, NVFP4 mode)" fail "routed to: $LMHEAD_ROUTE" ;;
+  esac
+else
+  # BF16 mode: the witness is the once-only dense-serve line; a repack
+  # string alongside it is a silent downgrade.
+  if grep -q "native BF16 head served dense" "$LOG"; then
+    if grep -q "packing from the model's own weights\|falling back to requant pack" "$LOG"; then
+      gate "lm_head served dense (BF16 mode)" fail "silent lm_head downgrade"
+    else
+      gate "lm_head served dense (BF16 mode)" ok
+    fi
+  else
+    gate "lm_head served dense (BF16 mode)" fail "no 'native BF16 head served dense' witness"
+  fi
+fi
 
 grep -q "falling back to requant pack\|packing from the model's own weights" "$LOG" \
   && gate "no lm_head repack fallback" fail "silent lm_head downgrade" \
@@ -253,9 +331,9 @@ grep -qE "route map: M=[0-9]+ N=[0-9]+ K=[0-9]+ -> qpn2" "$LOG" \
 CENSUS=$(grep -c "QPN8_CENSUS_LOAD" "$LOG" || true)
 INELIGIBLE=$(grep -c "QPN8_CENSUS_LOAD.*eligible=NO" "$LOG" || true)
 # The launch claim is an EXACT number: 2 protected modules per layer x 64
-# layers x 4 ranks = 512. "Any positive count" would pass a boot that silently
-# dropped modules, which is the failure this gate exists to catch.
-CENSUS_EXPECTED=$((128 * 4))
+# layers x TP ranks (128 x TP). "Any positive count" would pass a boot that
+# silently dropped modules, which is the failure this gate exists to catch.
+CENSUS_EXPECTED=$((128 * TP))
 [ "${CENSUS:-0}" = "$CENSUS_EXPECTED" ] && [ "${INELIGIBLE:-0}" = 0 ] \
   && gate "QPN8 census exactly $CENSUS_EXPECTED, 0 ineligible" ok \
   || gate "QPN8 census exactly $CENSUS_EXPECTED" fail "census=$CENSUS ineligible=$INELIGIBLE"

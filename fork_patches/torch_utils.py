@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
 # Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
 # (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
 # Changes: adds checkpoint_kv_quant_allowed() -- a checkpoint's
@@ -644,9 +643,7 @@ def create_kv_caches_with_random(
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             key_cache.uniform_(-scale, scale)
         elif cache_dtype in fp8_cache_dtypes:
-            _generate_random_fp8(
-                key_cache, -scale, scale, kv_dtype=str(cache_dtype)
-            )
+            _generate_random_fp8(key_cache, -scale, scale, kv_dtype=str(cache_dtype))
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_cache)
@@ -658,9 +655,7 @@ def create_kv_caches_with_random(
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             value_cache.uniform_(-scale, scale)
         elif cache_dtype in fp8_cache_dtypes:
-            _generate_random_fp8(
-                value_cache, -scale, scale, kv_dtype=str(cache_dtype)
-            )
+            _generate_random_fp8(value_cache, -scale, scale, kv_dtype=str(cache_dtype))
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
         value_caches.append(value_cache)
@@ -676,6 +671,11 @@ def async_tensor_h2d(
     """Asynchronously create a tensor and copy it from host to device."""
     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     return t.to(device=device, non_blocking=True)
+
+
+def np_to_pinned_tensor(array: np.ndarray) -> torch.Tensor:
+    tensor = torch.from_numpy(array)
+    return tensor.pin_memory() if PIN_MEMORY else tensor
 
 
 def make_ndarray_with_pad(

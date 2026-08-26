@@ -8,12 +8,12 @@
 # Nothing here is specific to our machines: every path is derived from the
 # checkout or overridable by environment variable.
 #
-#   VLLM_WHEEL     OPTIONAL. Defaults to the pinned 1Cat-vLLM 1.2.2 release
+#   VLLM_WHEEL     OPTIONAL. Defaults to the pinned 1Cat-vLLM 1.3.0 release
 #                  URL, whose SHA256 is pinned below and verified before
 #                  installation. If you override it you MUST also set
 #                  VLLM_WHEEL_SHA256 -- an unverified wheel is refused.
 #   VLLM_WHEEL_SHA256  required alongside a custom VLLM_WHEEL
-#                  1cat-vllm 1.2.2 — 1Cat AI's SM70/Volta fork of vLLM,
+#                  1cat-vllm 1.3.0 — 1Cat AI's SM70/Volta fork of vLLM,
 #                  Apache-2.0: https://github.com/1CatAI/1Cat-vLLM
 #                  This project is a set of NVFP4/FP8 kernels and patches
 #                  ON TOP of that engine; it is not an engine itself.
@@ -62,8 +62,8 @@ export PATH="$(dirname "$NVCC"):$PATH"
 
 # The exact wheel every published number was measured on. Digest verified
 # against the installed artifact on the reference machine.
-PINNED_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.2.2/1cat_vllm-1.2.2-cp312-cp312-linux_x86_64.whl"
-PINNED_WHEEL_SHA256="8a628983ad9d675559910372643220c418b307ddc7fd52ac65a7f5fbcb104bc6"
+PINNED_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.3.0/1cat_vllm-1.3.0-cp312-cp312-linux_x86_64.whl"
+PINNED_WHEEL_SHA256="2bdb14a9c44f83ee6a766d88ed0d85b11390d6f5d65747e8dbe80a8e2d5d63e0"
 VLLM_WHEEL="${VLLM_WHEEL:-$PINNED_WHEEL_URL}"
 VLLM_WHEEL_SHA256="${VLLM_WHEEL_SHA256:-}"
 [ -n "$VLLM_WHEEL_SHA256" ] || \
@@ -89,9 +89,9 @@ fi
 "$PY" -m pip install --upgrade pip >/dev/null
 
 say "installing pinned vLLM wheel"
-# The README pins 1.2.2 and every published number was measured on it; 1Cat
-# has since released 1.3.0, so an unchecked wheel silently changes the engine
-# under the results. Verify the version, and the digest when one is supplied.
+# The README pins the engine and every published number was measured on it;
+# this branch upgrades the pin to 1.3.0 (long-context D=256 prefill). Verify
+# the version, and the digest when one is supplied.
 # Fetch a remote wheel to a local file FIRST, so the digest is checked against
 # the bytes that get installed. Hashing only local paths let a URL install
 # unverified, which is the weakest link in a "reproducible" bootstrap.
@@ -135,10 +135,10 @@ else:
     print("")
 EOF
 )
-[ "$INSTALLED" = "1.2.2" ] || { [ "${ALLOW_WHEEL_MISMATCH:-0}" = 1 ] && \
-    echo "    WARNING: installed 1cat-vllm $INSTALLED, not 1.2.2" >&2; } || die \
-  "installed 1cat-vllm is '${INSTALLED:-<none>}', not 1.2.2
-   Every published number was measured on 1.2.2. Override with
+[ "$INSTALLED" = "1.3.0" ] || { [ "${ALLOW_WHEEL_MISMATCH:-0}" = 1 ] && \
+    echo "    WARNING: installed 1cat-vllm $INSTALLED, not 1.3.0" >&2; } || die \
+  "installed 1cat-vllm is '${INSTALLED:-<none>}', not 1.3.0
+   This branch targets 1Cat-vLLM 1.3.0. Override with
    ALLOW_WHEEL_MISMATCH=1 if you intend a different engine."
 echo "    1cat-vllm $INSTALLED (from installed metadata)"
 
@@ -156,7 +156,7 @@ echo "    1cat-vllm $INSTALLED (from installed metadata)"
 say "pinning tilelang 0.1.10 + apache-tvm-ffi 0.1.10 (required for SM70)"
 "$PY" -m pip install "tilelang==0.1.10" "apache-tvm-ffi==0.1.10"
 
-# pip WILL print a red dependency-conflict block here: the 1cat-vllm 1.2.2 wheel
+# pip WILL print a red dependency-conflict block here: the 1cat-vllm wheel
 # declares tilelang==0.1.9 and apache-tvm-ffi==0.1.9. Overriding it is
 # deliberate -- 0.1.9 does not build on Volta. Say so, because otherwise every
 # user reasonably assumes the install broke.
