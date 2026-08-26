@@ -381,6 +381,10 @@ _LMHEAD_ENABLED = os.environ.get("VLLM_SKINNY_LMHEAD", "0") == "1"
 # nibbles, value = e2m1 * fp8_scale * weight_scale_2, bf16-exact vs the
 # CT rendering on all sampled rows. Requires VLLM_SKINNY_LMHEAD=1.
 _LMHEAD_NATIVE = os.environ.get("VLLM_SKINNY_LMHEAD_NATIVE", "")
+# BF16-LMHead checkpoint (VLLM_SKINNY_LMHEAD_BF16=1): the checkpoint's
+# lm_head is a dense BF16 tensor, not quantized. Serve it dense via the
+# original fp16 linear — never repack, never pull native codes.
+_LMHEAD_BF16 = os.environ.get("VLLM_SKINNY_LMHEAD_BF16", "0") == "1"
 
 
 def _lmhead_resolve_native_path():
@@ -536,6 +540,11 @@ if _LMHEAD_ENABLED:
                 or w.shape[1] % 128 != 0 or w.shape[0] % 64 != 0
                 or x.dtype != torch.half or bias is not None):
             return _orig_embed_apply(self, layer, x, bias)
+        if _LMHEAD_BF16:
+            logger.info_once(
+                "Skinny lm_head: native BF16 head served dense (N=%d K=%d, no repack)",
+                w.shape[0], w.shape[1])
+            return _orig_embed_apply(self, layer, x, bias)
         if not hasattr(layer, "skinny_lm_codes"):
             if _LMHEAD_NATIVE:
                 _lmhead_load_native(layer)
@@ -593,6 +602,8 @@ if _LMHEAD_ENABLED:
     def _skinny_embed_pw(self, layer):
         if _orig_embed_pw is not None:
             _orig_embed_pw(self, layer)
+        if _LMHEAD_BF16:
+            return
         w = getattr(layer, "weight", None)
         # ParallelLMHead only — embed_tokens shares the vocab shape and
         # would eat ~180 MB/rank of head codes it never reads.
@@ -605,6 +616,45 @@ if _LMHEAD_ENABLED:
 
     UnquantizedEmbeddingMethod.process_weights_after_loading = \
         _skinny_embed_pw
+
+    # BF16-LMHead: ModelOpt hands the unquantized head an
+    # UnquantizedLinearMethod (never None), so the
+    # UnquantizedEmbeddingMethod hook above never fires for it. Wrap
+    # UnquantizedLinearMethod.apply to witness the dense serve; the
+    # original apply is dense-correct — no pack, no repack, ever.
+    if _LMHEAD_BF16:
+        from vllm.model_executor.layers.linear import (
+            UnquantizedLinearMethod,
+        )
+
+        _orig_lin_apply = UnquantizedLinearMethod.apply
+
+        def _skinny_lin_apply(self, layer, x, bias=None):
+            if layer.__class__.__name__ == "ParallelLMHead":
+                w = getattr(layer, "weight", None)
+                if w is not None and w.dim() == 2:
+                    logger.info_once(
+                        "Skinny lm_head: native BF16 head served dense "
+                        "(N=%d K=%d, no repack)",
+                        w.shape[0], w.shape[1])
+            return _orig_lin_apply(self, layer, x, bias)
+
+        UnquantizedLinearMethod.apply = _skinny_lin_apply
+    # Deterministic BF16-native witness at LOAD time: the runtime forward path
+    # does not reliably log on every boot, so also emit it at weight-load.
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod as _ULM
+    _orig_ulm_pw = _ULM.process_weights_after_loading if hasattr(_ULM, "process_weights_after_loading") else None
+    def _bf16_ulm_pw(self, layer):
+        if _orig_ulm_pw is not None:
+            _orig_ulm_pw(self, layer)
+        if (_LMHEAD_BF16 and getattr(layer, "weight", None) is not None
+                and type(layer).__name__ == "ParallelLMHead"
+                and layer.weight.dim() == 2):
+            logger.info_once(
+                "Skinny lm_head: native BF16 head served dense (N=%d K=%d, no repack)",
+                layer.weight.shape[0], layer.weight.shape[1],
+            )
+    _ULM.process_weights_after_loading = _bf16_ulm_pw
     logger.info_once("Skinny 4-bit lm_head path enabled (M<=64).")
 
     # Fused greedy argmax (VLLM_SKINNY_FUSED_ARGMAX=1): plug the fused
