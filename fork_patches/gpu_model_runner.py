@@ -326,8 +326,11 @@ def _dflash_ddtree_trace_event(
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
-def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
-    valid_token_mask = output_token_ids != -1
+def _count_contiguous_spec_tokens(
+    output_token_ids: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    valid_token_mask = (output_token_ids >= 0) & (output_token_ids < vocab_size)
     token_offsets = torch.arange(
         output_token_ids.shape[1],
         device=output_token_ids.device,
@@ -3086,6 +3089,36 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Hybrid postprocess writes accepted-token counts into row-indexed pinned
+        # buffers asynchronously. Complete the prior D2H copy before any request
+        # removal can change row ownership. Steady batches retain the existing
+        # later synchronization and therefore lose no CPU/GPU overlap.
+        cached_req_ids = set(self.input_batch.req_id_to_index)
+        resumed_req_ids = set(
+            scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        unscheduled_req_ids = cached_req_ids - (
+            scheduled_req_ids - resumed_req_ids
+        )
+        replaces_streaming_request = any(
+            req.req_id in self.input_batch.req_id_to_index
+            for req in scheduler_output.scheduled_new_reqs
+        )
+        mutates_batch_rows = bool(
+            scheduler_output.finished_req_ids
+            or unscheduled_req_ids
+            or replaces_streaming_request
+        )
+        if (
+            mutates_batch_rows
+            and self.use_async_scheduling
+            and self.num_accepted_tokens_event is not None
+        ):
+            sm70_trace_event_sync(
+                self.num_accepted_tokens_event,
+                "GPUModelRunner.num_accepted_tokens_event.pre_batch_mutation",
+            )
         self._dynamic_draft_vocab_prefill_bootstrap.clear_finished_requests(
             scheduler_output.finished_req_ids
         )
@@ -3119,16 +3152,12 @@ class GPUModelRunner(
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
-        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
-        cached_req_ids = self.input_batch.req_id_to_index.keys()
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
         # apart from the forced-preemption case in reset_prefix_cache. And in
         # that case we include the resumed_req_ids in the unscheduled set so
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -3512,7 +3541,10 @@ class GPUModelRunner(
             spec_state_slot_selectors = self.spec_state_slot_selectors.gpu[:num_reqs]
             profile_sidecar_cpu = True
         else:
-            num_accepted_tokens = _count_contiguous_spec_tokens(output_token_ids)
+            num_accepted_tokens = _count_contiguous_spec_tokens(
+                output_token_ids,
+                self.input_batch.vocab_size,
+            )
             spec_state_slot_selectors = num_accepted_tokens
             num_accepted_tokens_cpu = None
             spec_state_slot_selectors_cpu = None
@@ -3817,7 +3849,10 @@ class GPUModelRunner(
             dtype=torch.int32,
             device=sampled_token_ids.device,
         ).clamp(max=sampled_token_ids.shape[1])
-        valid_sampled_token_counts = _count_contiguous_spec_tokens(sampled_token_ids)
+        valid_sampled_token_counts = _count_contiguous_spec_tokens(
+            sampled_token_ids,
+            self.input_batch.vocab_size,
+        )
         clamped_counts = torch.minimum(valid_sampled_token_counts, max_generated)
         if torch.equal(clamped_counts, valid_sampled_token_counts):
             return sampler_output
@@ -8267,7 +8302,10 @@ class GPUModelRunner(
             )
         if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"):
             sampled_token_ids = sampler_output.sampled_token_ids
-            valid_sampled_count = _count_contiguous_spec_tokens(sampled_token_ids)
+            valid_sampled_count = _count_contiguous_spec_tokens(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+            )
             payload: dict[str, object] = {
                 "req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
                 "sampled_token_ids": sampled_token_ids,
